@@ -15,13 +15,15 @@
 	GNU General Public License for more details.
 */
 
-#include "orange.h"
-#include "orange_rpc.h"
-#include "internal.h"
 #include <pthread.h>
 #include <unistd.h>
 #include <syslog.h>
+#include <sys/prctl.h>
 
+#include "orange.h"
+#include "orange_rpc.h"
+#include "orange_eq.h"
+#include "internal.h"
 #include "util.h"
 
 #define WORKER_TIMEOUT_US 10000000UL
@@ -248,9 +250,42 @@ int orange_rpc_process_requests(struct orange_rpc *self){
 	return 0; 
 }
 
+static void *_event_queue_task(void *ptr){
+	struct orange_rpc *self = (struct orange_rpc*) ptr; 
+	struct orange_eq eq; 
+
+	prctl(PR_SET_NAME, "local_event_queue"); 
+	if(orange_eq_open(&eq, NULL, true) != 0){
+		perror("Unable to open local message queue"); 
+		fprintf(stderr, "If you see 'Function not implemented' above, then enable CONFIG_POSIX_MQUEUE in your kernel to use local events\n");  
+		return NULL; 
+	}
+
+	pthread_mutex_lock(&self->lock); 
+	while(!self->shutdown){
+		pthread_mutex_unlock(&self->lock); 
+		struct blob b; 
+		if(orange_eq_recv(&eq, &b) <= 0) goto cont;
+		const struct blob_field *name = blob_field_first_child(blob_head(&b)); 
+		const struct blob_field *data = blob_field_next_child(blob_head(&b), name); 
+		if(!name || !data ) goto cont;  
+		orange_rpc_broadcast_event(self, blob_field_get_string(name), data); 		
+	cont: 
+		pthread_mutex_lock(&self->lock); 
+	}
+	pthread_mutex_unlock(&self->lock); 
+
+	orange_eq_close(&eq); 
+
+	DEBUG("rpc queue listener exiting..\n"); 
+	pthread_exit(0); 
+	return NULL; 
+}
+
 #ifdef CONFIG_THREADS
 static void *_request_dispatcher(void *ptr){
 	struct orange_rpc *self = (struct orange_rpc*)ptr; 
+	prctl(PR_SET_NAME, "request_dispatcher"); 
 	pthread_mutex_lock(&self->lock); 
 	while(!self->shutdown){
 		sem_wait(&self->sem_bw); 
@@ -269,6 +304,7 @@ static void *_request_dispatcher(void *ptr){
 // this is highly critical so we need to monitor for it
 static void *_request_monitor(void *ptr){
 	struct orange_rpc *self = (struct orange_rpc*)ptr; 
+	prctl(PR_SET_NAME, "request_monitor"); 
 	pthread_mutex_lock(&self->lock); 
 	while(!self->shutdown){
 		struct request_record *req, *tmp; 
@@ -280,54 +316,12 @@ static void *_request_monitor(void *ptr){
 				hanged++; 
 			}
 		}
-
-		// we probably don't even need to use a semaphore for this..
-		#if 0
-		// NOTE: this is so far just a possible solution (it has several problems still)
-		int sem = 0; 
-		sem_getvalue(&self->sem_bw, &sem); 
-		DEBUG("monitor: free slots: %d, hanged threads: %d\n", sem, hanged);  
-		if(sem == 0 && hanged == (int)self->num_workers){
-			// we have a bunch of hanged calls and no free slots so this is bad
-			syslog(LOG_CRIT, "no free request slots left. All %d slots are busy! restarting server..", self->num_workers); 
-			FILE *cf = fopen("/proc/self/cmdline", "r"); 
-			char buf[255]; 
-			int len = fread(buf, 1, sizeof(buf), cf); 
-			int argc = 0; 
-			char **argv = NULL; 
-			for(int c = 0; c < len; c++){
-				if(buf[c] == 0) argc++; 
-			}
-			if(argc > 0){
-				argv = malloc(sizeof(char*) * argc + 1); 
-				memset(argv, 0, sizeof(char*) * argc + 1);  
-				int arg = 0; 
-				char *ptr = argv[arg++] = buf; 
-				for(int c = 0; c < len; c++){
-					if(buf[c] == 0) {
-						while(buf[c] == 0 && c < len) c++; 
-						argv[arg++] = buf + c; 
-					}
-				}
-			}
-			// FIXME: close all file descriptors
-			/*for(int c = 3; c < 1024; c++){
-				close(c); 
-			}*/
-			printf("restarting process with args: "); 
-			char **a = argv; 
-			while(*a){ printf("%s ", *a); a++; }
-			printf("\n"); 
-
-			execv("/proc/self/exe", argv); 
-			// never get here. 
-		}
-#endif
 		pthread_mutex_unlock(&self->lock); 
 		sleep(5); 
 		pthread_mutex_lock(&self->lock); 
 	}
 	pthread_mutex_unlock(&self->lock); 
+	DEBUG("rpc monitor exiting..\n"); 
 	pthread_exit(0); 
 	return NULL; 
 }
@@ -356,7 +350,11 @@ void orange_rpc_init(struct orange_rpc *self, orange_server_t server, struct ora
 
 	// start a monitor thread to check periodically if we are running out of workers
 	pthread_create(&self->monitor, NULL, _request_monitor, self); 
+
 	#endif
+
+	// start event queue task
+	pthread_create(&self->eq_task, NULL, _event_queue_task, self);   
 }
 
 void orange_rpc_deinit(struct orange_rpc *self){
@@ -366,9 +364,30 @@ void orange_rpc_deinit(struct orange_rpc *self){
 	for(unsigned c = 0; c < self->num_workers; c++){
 		pthread_join(self->threads[c], NULL); 
 	}
+	pthread_join(self->eq_task, NULL); 
 	pthread_join(self->monitor, NULL); 
 	pthread_mutex_destroy(&self->lock); 
 	free(self->threads); 
+}
+
+void orange_rpc_broadcast_event(struct orange_rpc *self, const char *name, const struct blob_field *data){
+	pthread_mutex_lock(&self->lock); 
+	// send broadcast message
+	struct orange_message *result = orange_message_new(); 
+	result->peer = 0; 
+
+	blob_offset_t t = blob_open_table(&result->buf); 
+	blob_put_string(&result->buf, "jsonrpc"); 
+	blob_put_string(&result->buf, "2.0"); 
+	blob_put_string(&result->buf, "method"); 
+	blob_put_string(&result->buf, name); 
+	blob_put_string(&result->buf, "params"); 
+	blob_put_attr(&result->buf, data); 
+	blob_close_table(&result->buf, t); 
+
+	orange_server_send(self->server, &result); 
+
+	pthread_mutex_unlock(&self->lock); 
 }
 
 //bool orange_rpc_running(struct orange_rpc *self){
