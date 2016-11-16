@@ -19,14 +19,14 @@ end
 
 local function system_get_skip()
         local result = {};                                                                                    
-        local stdout = juci.shell("uci get system.@system[0].linkit_firstboot");                                                
+        local stdout = juci.shell("uci get system.@system[0].version_skip");                                                
         result["results"] = string.sub(stdout,0,string.len(stdout)-1)                                                                    
         return result;  	
 end
 local function system_set_skip(msg)
 --	local msg = json.decode(msgs)
         local result = {};      
-        local stdout = juci.shell("uci set system.@system[0].linkit_firstboot=%s",msg.value);
+        local stdout = juci.shell("uci set system.@system[0].version_skip=%s",msg.value);
         result["results"] = "done"    
         return result;
 end
