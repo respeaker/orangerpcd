@@ -31,10 +31,49 @@ local function system_set_skip(msg)
         return result;
 end
 
+local function system_download(msg)
+	local result = {};
+        os.execute("wget  -O /tmp/firmware.bin -o /tmp/wget-log -b  https://s3-us-west-2.amazonaws.com/respeaker.io/firmware/ramips-openwrt-latest-LinkIt7688-squashfs-sysupgrade.bin");
+	result["results"] = "done"
+	return result;
+end
+
+local function system_progress()
+	local result = {};
+	local lines = {};
+	result["results"] = lines;
+	local stdout = juci.shell("cat /tmp/wget-log | tail -2");
+	for line in stdout:gmatch("[^\r\n]+") do
+		local size= line:match("([%d]*%%)")
+		local obj = {
+			["size"] = size,
+		};
+		table.insert(lines, obj);
+		return result;
+	end			
+end
+
+local function system_check()
+	local stdout = juci.shell("md5sum /tmp/firmware.bin | awk '{printf $1}'");
+	local result = {};
+	result["results"] = stdout;
+	return result;
+end
+local function system_upgrade() 
+	local result = {};
+	os.execute("sysupgrade /tmp/firmware.bin &");		
+	result["results"] = "done"
+	return result;
+end
+
 return {
 	board = system_board,
 	info = system_info,
 	getskip = system_get_skip,
-	setskip = system_set_skip
+	setskip = system_set_skip,
+	download = system_download,
+	progress = system_progress,	
+	check = system_check,
+	upgrade = system_upgrade
 };
 
