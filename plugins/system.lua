@@ -41,14 +41,9 @@ end
 
 local function system_progress()
 	local result = {};
-    local is_error = juci.shell("cat /tmp/wget-fw.log | tail -2");
-    for line in is_error:gmatch("[^\r\n]+") do
-        if(string.find(line,"ERROR"))then
-            result["results"] ="download failed";
-            return result;
-        end
-    end
-    
+    local block = {};
+    result["results"]  = block;    
+    local obj = {};
 	local stdout = juci.shell("cat /tmp/wget-fw.log | tail -4");
 	for line in stdout:gmatch("[^\r\n]+") do
 		local size= line:match("([%d]*%%)")
@@ -58,19 +53,36 @@ local function system_progress()
             local json = json.decode(versionjson); 
             local fw_md5sum = juci.shell("md5sum /tmp/firmware.bin | awk '{printf $1}'");
             if(fw_md5sum == json.result.md5sum)then
-                result["results"] ="download success";
+                obj["progress"] = string.sub(size,0,string.len(size) -1);
+                obj["status"] = "ok"; 
             else
-                result["results"] ="download failed";
+                obj["progress"] = string.sub(size,0,string.len(size) -1);
+                obj["status"] = "error";  
             end
         else
-            result["results"] = string.sub(size,0,string.len(size) -1);
+             obj["progress"] = string.sub(size,0,string.len(size) -1);
+             obj["status"] = "downloading";  
         end
-		return result;
-	end			
+        break;
+	end	
+	
+    local is_error = juci.shell("cat /tmp/wget-fw.log | tail -2");
+    for line in is_error:gmatch("[^\r\n]+") do
+        if(string.find(line,"ERROR"))then
+            obj["status"] = "error";
+            if(obj["progress"] == nil)then
+                obj["progress"] = "";
+            end
+            break;
+        end
+    end
+    
+    table.insert(block, obj);    
+    return result;
 end
 
 
-local function get_current_version()
+local function get_current_version_number()
     local file = io.open("/etc/openwrt_release", "rb");
     for line in file:lines() do  
         if(string.find(line,"DISTRIB_REVISION="))then
@@ -80,20 +92,38 @@ local function get_current_version()
     end  
     return nil;
 end
+local function get_current_version_str()
+    local file = io.open("/etc/openwrt_release", "rb");
+    for line in file:lines() do  
+        if(string.find(line,"DISTRIB_REVISION="))then
+            return string.sub(line,19,string.len(line)-1);
+        end
+    end  
+    return nil;
+end
+
 
 
 local function system_check()
 	local result = {};
+    local block = {};
+    local obj = {};
+    local tmp_obj = {};
+    result["results"]  = block;
     local file = io.open("/tmp/version.json", "rb");
     if(file == nil) then
         os.execute("wget -O /tmp/version.json -o /tmp/wget-version.log https://s3-us-west-2.amazonaws.com/respeaker.io/firmware/version.json")
-        os.execute("sleep 3")
+        os.execute("sleep 3");
     end
     
     local is_error = juci.shell("cat /tmp/wget-version.log | tail -2");
     for line in is_error:gmatch("[^\r\n]+") do
         if(string.find(line,"ERROR"))then
-            result["results"] ="check failed";
+            obj["current_version"] = get_current_version_str();
+            obj["latest_version"] = "";
+            obj["status"] = "error";
+            table.insert(block, tmp_obj);
+            table.insert(block, obj);
             return result;
         end
     end
@@ -106,28 +136,46 @@ local function system_check()
             local versionjson = file:read("*a");  
             local json = json.decode(versionjson); 
             
-            local tmp_version = string.sub(json.result.version,2,string.len(json.result.version));
-            local last_version = string.gsub(tmp_version,"%p","")
-            --print(last_version) 
-            local tmp_version_skip = juci.shell("uci get system.@system[0].version_skip");
-            local version_skip = string.sub(tmp_version_skip,0,string.len(tmp_version_skip));
+            local latest_version = string.sub(json.result.latest_version,2,string.len(json.result.latest_version));
+            local latest_version_num = string.gsub(latest_version,"%p","")
+            --print(latest_version_num) 
+            local version_skip = juci.shell("uci get system.@system[0].version_skip");
+            local version_skip_num = string.sub(version_skip,0,string.len(version_skip));
 	        --print(version_skip)            
 
-            if(last_version - get_current_version() > tonumber(version_skip))then
-                result["results"] = json.result;
-                file:close();
-                return result;              
+            if(latest_version_num - get_current_version_number() > tonumber(version_skip_num))then
+                obj["status"] = "ok";
+                table.insert(block, json.result);   
             else
-                result["results"] = "no update";
-                file:close();
-                return result;                
-            end
-        else
+                obj["latest_version"] = json.result.latest_version;
+                obj["status"] = "skiped";              
+            end           
             file:close();
-            result["results"] = "checking";
-            return result;                
+            break; 
+        else
+            obj["latest_version"] = "";
+            obj["status"] = "checking";                
         end
     end	
+
+    if(obj["status"] ~= "ok")then
+        table.insert(block, tmp_obj);
+    end
+    
+    fw_file = io.open("/tmp/firmware.bin", "rb");
+    if(fw_file ~= nil)then
+        obj["status"] = "downloading"; 
+        fw_file:close();
+    end
+    
+    obj["current_version"]= get_current_version_str();
+    table.insert(block, obj);
+    
+    if(obj["status"] ~= "checking")then
+        os.execute("rm /tmp/wget-version.log")
+        os.execute("rm /tmp/version.json")
+    end    
+
 	return result;
 end
 
@@ -135,6 +183,7 @@ end
 
 local function system_upgrade() 
 	local result = {};
+    os.execute("uci set system.@system[0].version_skip=0");	
 	os.execute("sysupgrade /tmp/firmware.bin &");		
 	result["results"] = "done"
 	return result;
