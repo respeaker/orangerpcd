@@ -170,8 +170,8 @@ local function system_check()
     
     obj["current_version"]= get_current_version_str();
     table.insert(block, obj);
-    
-    if(obj["status"] ~= "checking")then
+   
+	if(obj["status"] ~= "checking" and obj["status"] ~= "downloading")then 
         os.execute("rm /tmp/wget-version.log")
         os.execute("rm /tmp/version.json")
     end    
