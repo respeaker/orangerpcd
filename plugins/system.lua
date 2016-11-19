@@ -60,7 +60,9 @@ local function system_progress()
                 obj["status"] = "error";  
             end
         else
-             obj["progress"] = string.sub(size,0,string.len(size) -1);
+             if(size ~= nil)then
+                obj["progress"] = string.sub(size,0,string.len(size) -1);
+             end
              obj["status"] = "downloading";  
         end
         break;
